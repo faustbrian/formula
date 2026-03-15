@@ -10,3 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Initial release
 - Added repository-level maintainer guidance in `AGENTS.md`.
+
+### Changed
+- Expanded PHPDoc across `src` to document evaluator behavior, scope
+  resolution rules, canonicalization guarantees, and error contracts.

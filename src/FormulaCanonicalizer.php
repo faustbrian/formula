@@ -22,12 +22,29 @@ use function json_encode;
 use function ksort;
 
 /**
+ * Produces a deterministic serialized representation of a formula tree.
+ *
+ * Canonicalization exists so semantically identical associative structures
+ * produce the same byte sequence regardless of input key ordering. This is the
+ * normalization step consumed by `FormulaHasher` before hashing.
+ *
+ * Positional list ordering is preserved because list order is meaningful for
+ * operators such as `if`, arithmetic pairs, and comparisons. Only associative
+ * arrays are key-sorted recursively.
+ *
  * @author Brian Faust <brian@cline.sh>
  * @psalm-immutable
  */
 final readonly class FormulaCanonicalizer
 {
     /**
+     * Serialize a formula after recursively normalizing associative key order.
+     *
+     * Unescaped slashes are used to avoid incidental digest differences when
+     * canonicalized output is later hashed. Low-level JSON failures are wrapped
+     * in `RuntimeException` because canonicalization is treated as an
+     * infrastructure concern, not a normal evaluation error.
+     *
      * @param array<string, mixed> $expression
      */
     public function canonicalize(array $expression): string
@@ -42,6 +59,13 @@ final readonly class FormulaCanonicalizer
         }
     }
 
+    /**
+     * Recursively normalize associative ordering while preserving list order.
+     *
+     * Scalars are returned unchanged. Lists are traversed in order, while
+     * associative arrays are copied, normalized entry-by-entry, and key-sorted
+     * to make the final JSON representation deterministic.
+     */
     private function sortRecursively(mixed $value): mixed
     {
         if (!is_array($value)) {

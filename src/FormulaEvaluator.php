@@ -31,16 +31,39 @@ use function sprintf;
 use function ucfirst;
 
 /**
+ * Recursive interpreter for the formula expression language.
+ *
+ * The evaluator walks a JSON-like expression tree and resolves each node into
+ * a `FormulaEvaluationResult`. It distinguishes literals from operator nodes,
+ * resolves variable paths against the current scope, enforces operand shape and
+ * runtime type rules, and delegates predicate execution to
+ * `PredicateEvaluatorInterface`.
+ *
+ * Evaluation is fail-fast. The first invalid node, missing variable, or type
+ * mismatch returns a failure result that bubbles back up unchanged. Nested
+ * collection operators maintain lexical-style alias bindings in `vars`, while
+ * the original caller context remains in `root`. Alias variables always shadow
+ * equally named top-level root keys.
+ *
  * @author Brian Faust <brian@cline.sh>
  * @psalm-immutable
  */
 final readonly class FormulaEvaluator
 {
+    /**
+     * @param PredicateEvaluatorInterface $predicateEvaluator Predicate engine used by the `predicate` operator
+     */
     public function __construct(
         private PredicateEvaluatorInterface $predicateEvaluator = new RulerPredicateEvaluator(),
     ) {}
 
     /**
+     * Evaluate a formula against the provided root context.
+     *
+     * Callers provide only top-level context data. Nested alias scopes are
+     * introduced internally by higher-order operators and stored in the `vars`
+     * portion of the recursive scope structure.
+     *
      * @param array<string, mixed> $expression
      * @param array<string, mixed> $context
      */
@@ -53,6 +76,12 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Evaluate a single node in the expression tree.
+     *
+     * Scalar values are treated as inline literals. Arrays may represent a
+     * `{const: ...}` wrapper, a `{var: ...}` lookup, or exactly one operator
+     * node. Any other array shape is rejected before operator dispatch.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluateNode(mixed $node, array $scope): FormulaEvaluationResult
@@ -120,6 +149,14 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Resolve a variable node against the current scope.
+     *
+     * Variable paths are dot-delimited. Resolution first checks alias bindings
+     * in `vars` using the first path segment, then falls back to the immutable
+     * root context. When the path is missing and the node defines `default`,
+     * that default is returned as a successful value. Otherwise the lookup
+     * fails with `FormulaErrorCode::MissingVariable`.
+     *
      * @param array<string, mixed>                                          $node
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
@@ -151,6 +188,12 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Delegate the `predicate` operator to the configured predicate evaluator.
+     *
+     * The operand must contain a `rule` array. Any compilation or runtime
+     * issues inside the backing predicate engine are normalized by the delegate
+     * into a failed `FormulaEvaluationResult`.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluatePredicate(mixed $operand, array $scope): FormulaEvaluationResult
@@ -169,6 +212,11 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Evaluate `count`, requiring the resolved operand to be an array.
+     *
+     * The operator counts only arrays produced by formula evaluation. Other
+     * scalar values are not coerced into iterable form.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluateCount(mixed $operand, array $scope): FormulaEvaluationResult
@@ -190,6 +238,10 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Reduce a list of numeric operands using addition.
+     *
+     * An empty list resolves to the additive identity `0.0`.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluateAdd(mixed $operand, array $scope): FormulaEvaluationResult
@@ -203,6 +255,10 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Reduce a list of numeric operands using multiplication.
+     *
+     * An empty list resolves to the multiplicative identity `1.0`.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluateMultiply(mixed $operand, array $scope): FormulaEvaluationResult
@@ -216,6 +272,11 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Evaluate ordered binary subtraction.
+     *
+     * The operator requires exactly two numeric operands and subtracts the
+     * second value from the first.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluateSubtract(mixed $operand, array $scope): FormulaEvaluationResult
@@ -230,6 +291,11 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Evaluate ordered binary division with explicit zero-divisor protection.
+     *
+     * The operator requires exactly two numeric operands and fails with
+     * `FormulaErrorCode::DivisionByZero` when the divisor resolves to `0.0`.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluateDivide(mixed $operand, array $scope): FormulaEvaluationResult
@@ -251,6 +317,11 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Return the largest value from a non-empty numeric operand list.
+     *
+     * Empty input is rejected because there is no neutral maximum value that
+     * preserves the operator's meaning.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluateMax(mixed $operand, array $scope): FormulaEvaluationResult
@@ -272,6 +343,10 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Return the smallest value from a non-empty numeric operand list.
+     *
+     * Empty input is rejected for the same reason as `max`.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluateMin(mixed $operand, array $scope): FormulaEvaluationResult
@@ -293,6 +368,12 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Evaluate operands left-to-right and return the first non-null success.
+     *
+     * If every branch either fails or resolves to `null`, the last failure is
+     * returned. Only when all branches succeed and resolve to `null` does the
+     * operator succeed with `null`.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluateCoalesce(mixed $operand, array $scope): FormulaEvaluationResult
@@ -322,6 +403,10 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Compare two evaluated operands using strict identity semantics.
+     *
+     * No loose PHP coercion is performed.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluateEquals(mixed $operand, array $scope): FormulaEvaluationResult
@@ -340,6 +425,10 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Compare two evaluated operands using strict non-identity semantics.
+     *
+     * This is the inverse of `equals` and also avoids loose PHP coercion.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluateNotEquals(mixed $operand, array $scope): FormulaEvaluationResult
@@ -358,6 +447,10 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Compare a numeric pair using the greater-than operator.
+     *
+     * Both operands must resolve to numeric values before comparison occurs.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluateGreaterThan(mixed $operand, array $scope): FormulaEvaluationResult
@@ -366,6 +459,10 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Compare a numeric pair using the greater-than-or-equal operator.
+     *
+     * Both operands must resolve to numeric values before comparison occurs.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluateGreaterThanOrEqual(mixed $operand, array $scope): FormulaEvaluationResult
@@ -374,6 +471,10 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Compare a numeric pair using the less-than operator.
+     *
+     * Both operands must resolve to numeric values before comparison occurs.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluateLessThan(mixed $operand, array $scope): FormulaEvaluationResult
@@ -382,6 +483,10 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Compare a numeric pair using the less-than-or-equal operator.
+     *
+     * Both operands must resolve to numeric values before comparison occurs.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluateLessThanOrEqual(mixed $operand, array $scope): FormulaEvaluationResult
@@ -390,6 +495,11 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Reduce a list of boolean operands using logical conjunction.
+     *
+     * Operands must already resolve to booleans; the evaluator does not apply
+     * PHP truthiness coercion here.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluateAnd(mixed $operand, array $scope): FormulaEvaluationResult
@@ -403,6 +513,11 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Reduce a list of boolean operands using logical disjunction.
+     *
+     * Operands must already resolve to booleans; the evaluator does not apply
+     * PHP truthiness coercion here.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluateOr(mixed $operand, array $scope): FormulaEvaluationResult
@@ -416,6 +531,11 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Invert a single boolean operand.
+     *
+     * Non-boolean values are rejected instead of being coerced via PHP's `!`
+     * semantics.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluateNot(mixed $operand, array $scope): FormulaEvaluationResult
@@ -437,6 +557,12 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Evaluate a ternary-style conditional in `[condition, then, else]` form.
+     *
+     * Only the selected branch is evaluated after the condition succeeds and
+     * resolves to a boolean, so the operator is lazy with respect to the
+     * then/else branches.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluateIf(mixed $operand, array $scope): FormulaEvaluationResult
@@ -465,6 +591,11 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Project a collection and add the resulting numeric values.
+     *
+     * The `in` expression is evaluated once per collection item with the
+     * declared alias bound into `vars`. Every projected value must be numeric.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluateSum(mixed $operand, array $scope): FormulaEvaluationResult
@@ -492,6 +623,10 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Project each item in a collection and return the resulting list.
+     *
+     * Alias bindings are scoped per item and do not leak back into the caller.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluateMap(mixed $operand, array $scope): FormulaEvaluationResult
@@ -504,6 +639,12 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Filter a collection by evaluating a boolean predicate for each item.
+     *
+     * The `where` expression runs with the declared alias bound in `vars`.
+     * Items are retained only when the predicate succeeds and resolves to
+     * `true`.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluateFilter(mixed $operand, array $scope): FormulaEvaluationResult
@@ -546,6 +687,11 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Project a collection and return the maximum projected numeric value.
+     *
+     * Every projected value must be numeric and the projection must not be
+     * empty. Mixed numeric and non-numeric output is rejected.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluateMaxOf(mixed $operand, array $scope): FormulaEvaluationResult
@@ -572,6 +718,11 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Project a collection and return the minimum projected numeric value.
+     *
+     * Every projected value must be numeric and the projection must not be
+     * empty. Mixed numeric and non-numeric output is rejected.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function evaluateMinOf(mixed $operand, array $scope): FormulaEvaluationResult
@@ -598,6 +749,13 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Evaluate a higher-order collection projection.
+     *
+     * This shared helper powers `map`, `sum`, `maxOf`, and `minOf`. It resolves
+     * the collection definition, binds each item to the declared alias in a
+     * nested scope, evaluates the requested projection expression, and returns
+     * the raw projected values.
+     *
      * @param  array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      * @return array<int, mixed>|FormulaEvaluationResult
      */
@@ -630,8 +788,14 @@ final readonly class FormulaEvaluator
     }
 
     /**
-     * @param  array{root: array<string, mixed>, vars: array<string, mixed>}                                 $scope
-     * @return array{0: array<int|string, mixed>|FormulaEvaluationResult, 1: string, 2: array<mixed, mixed>}
+     * Resolve the common `from`/`as`/projection contract for collection operators.
+     *
+     * The source expression must evaluate to an array. The returned tuple uses
+     * the first slot as either the resolved collection or an already prepared
+     * failure result so callers can short-circuit without additional wrapping.
+     *
+     * @param  array{root: array<string, mixed>, vars: array<string, mixed>}                   $scope
+     * @return array{0: array<int|string, mixed>|FormulaEvaluationResult, 1: string, 2: mixed}
      */
     private function resolveCollectionDefinition(mixed $operand, array $scope, string $projectionKey): array
     {
@@ -672,6 +836,11 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Resolve a list of operands and coerce each successful value to float.
+     *
+     * Child evaluation failures are returned unchanged. Successful non-numeric
+     * values are converted into `FormulaErrorCode::InvalidOperand`.
+     *
      * @param  array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      * @return array<int, float>|FormulaEvaluationResult
      */
@@ -717,6 +886,11 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Fold a numeric operand list with the provided reducer and seed.
+     *
+     * This helper backs variadic arithmetic operators whose semantics are fully
+     * defined by numeric reduction.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function reduceNumericOperands(
@@ -741,6 +915,11 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Fold a boolean operand list with the provided reducer and seed.
+     *
+     * Boolean operators validate explicit booleans instead of accepting PHP's
+     * broader notion of truthy and falsy values.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function reduceBooleanOperands(
@@ -779,6 +958,11 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Evaluate and return the left/right pair required by binary operators.
+     *
+     * Invalid operand structure is represented as two identical failures so the
+     * caller can keep a uniform "return left failure, else right failure" flow.
+     *
      * @param  array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      * @return array{0: FormulaEvaluationResult, 1: FormulaEvaluationResult}
      */
@@ -804,6 +988,10 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Compare a binary pair after numeric validation and float coercion.
+     *
+     * This helper backs the ordered comparison operators.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function compareNumericPair(mixed $operand, array $scope, callable $comparator): FormulaEvaluationResult
@@ -830,12 +1018,24 @@ final readonly class FormulaEvaluator
         );
     }
 
+    /**
+     * Determine whether a value is treated as an inline literal node.
+     *
+     * Arrays are excluded because they may represent operator nodes or
+     * structured data that must be wrapped in `{const: ...}` to stay literal.
+     */
     private function isScalar(mixed $value): bool
     {
         return $value === null || is_bool($value) || is_int($value) || is_float($value) || is_string($value);
     }
 
     /**
+     * Resolve a dot-delimited variable path using formula scope precedence.
+     *
+     * The first segment is checked against `vars` to support alias shadowing in
+     * nested collection operators. When no alias matches, the full path is
+     * resolved from the immutable root context.
+     *
      * @param array{root: array<string, mixed>, vars: array<string, mixed>} $scope
      */
     private function resolveVariable(string $path, array $scope): mixed
@@ -851,6 +1051,12 @@ final readonly class FormulaEvaluator
     }
 
     /**
+     * Traverse an array path and return a sentinel when any segment is missing.
+     *
+     * A fresh `stdClass` instance is used as the missing-value sentinel so the
+     * evaluator can distinguish "path not found" from a legitimate `null`
+     * value stored at the resolved location.
+     *
      * @param list<string> $segments
      */
     private function resolvePath(mixed $value, array $segments): mixed
